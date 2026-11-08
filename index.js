@@ -27,7 +27,6 @@
     let searchText = '';
     let editingBlock = null;
     let returnTab = 'library';
-    let observer = null;
     let personaObserver = null;
     let previewFormat = 'markdown';
     let previewDraft = null;
@@ -550,26 +549,6 @@
         }
     }
 
-    function applyToCurrentPersona() {
-        const output = buildOutput();
-        if (!output) {
-            notify('当前合成内容为空，请先填写并选择区块。', 'warning');
-            return;
-        }
-        const field = document.querySelector('#persona_description');
-        if (!(field instanceof HTMLTextAreaElement)) {
-            notify('没有找到 SillyTavern Persona 描述输入框。请确认扩展运行在酒馆主页面中。', 'warning');
-            return;
-        }
-        field.value = output;
-        field.dispatchEvent(new Event('input', { bubbles: true }));
-        if (field.value !== output) {
-            notify('Persona 描述框未能接收合成内容，请改用复制文本。', 'error');
-            return;
-        }
-        notify('内容已填入 Persona 描述框，并已触发酒馆原生 input 保存处理。', 'success');
-    }
-
     function downloadFile(name, content, mime) {
         const blob = new Blob([content], { type: mime || 'text/plain;charset=utf-8' });
         const url = URL.createObjectURL(blob);
@@ -780,8 +759,14 @@
         else if (action === 'download-output') downloadFile('user-persona.' + (previewFormat === 'plain' ? 'txt' : previewFormat), previewDraft ?? buildOutput(), previewFormat === 'json' ? 'application/json;charset=utf-8' : 'text/plain;charset=utf-8');
         else if (action === 'open-persona-inline') {
             closePanel();
-            document.querySelector('#upf-persona-inline')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            document.querySelector('#upf-persona-inline')?.querySelector('textarea')?.focus();
+            const personaToggle = document.querySelector('#persona-management-button');
+            const drawer = document.querySelector('#persona-management-button .drawer-content');
+            if (personaToggle && !drawer?.classList.contains('openDrawer')) personaToggle.click();
+            window.setTimeout(() => {
+                const inlinePanel = document.querySelector('#upf-persona-inline');
+                inlinePanel?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                inlinePanel?.querySelector('textarea')?.focus();
+            }, 180);
         }
         else if (action === 'export-library') exportLibrary();
         else if (action === 'import-library') importLibrary();
