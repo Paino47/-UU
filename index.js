@@ -148,36 +148,25 @@
     function formatOutput(format) {
         const blocks = getBuilderBlocks().filter(block => String(block.content || '').trim());
         if (format === 'plain') return buildOutput();
-        if (format === 'json') {
-            const data = {};
-            blocks.forEach(block => {
-                if (!data[block.category]) data[block.category] = [];
-                data[block.category].push({ title: block.title, content: block.content.trim() });
-            });
-            return JSON.stringify(data, null, 2);
-        }
+        const data = {};
+        blocks.forEach(block => {
+            if (!data[block.category]) data[block.category] = [];
+            data[block.category].push({ title: block.title, content: block.content.trim() });
+        });
+        if (format === 'json') return JSON.stringify(data, null, 2);
         if (format === 'yaml') {
-            const data = {};
-            blocks.forEach(block => {
-                if (!data[block.category]) data[block.category] = [];
-                data[block.category].push({ title: block.title, content: block.content.trim() });
-            });
             return Object.entries(data).map(([category, entries]) =>
-                JSON.stringify(category) + ':\\n' + entries.map(entry =>
-                    '  - title: ' + JSON.stringify(entry.title) + '\\n    content: ' + JSON.stringify(entry.content)
-                ).join('\\n')
-            ).join('\\n');
+                JSON.stringify(category) + ':\n' + entries.map(entry =>
+                    '  - title: ' + JSON.stringify(entry.title) + '\n    content: ' + JSON.stringify(entry.content)
+                ).join('\n')
+            ).join('\n');
         }
         const groups = [];
-        let currentCategory = null;
-        blocks.forEach(block => {
-            if (block.category !== currentCategory) {
-                currentCategory = block.category;
-                groups.push('## ' + currentCategory);
-            }
-            groups.push('- **' + block.title.replace(/\\*/g, '\\\\*') + '**：' + block.content.trim().replace(/\\n/g, '\\n  '));
+        Object.entries(data).forEach(([category, entries]) => {
+            groups.push('## ' + category);
+            entries.forEach(entry => groups.push('- **' + entry.title.replace(/\*/g, '\\*') + '**：' + entry.content.replace(/\n/g, '\n  ')));
         });
-        return groups.join('\\n\\n');
+        return groups.join('\n\n');
     }
 
     function syncPreviewDraft(force = false) {
