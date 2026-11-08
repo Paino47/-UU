@@ -1,767 +1,811 @@
-const MODULE_NAME = 'quick-command-bar';
+(() => {
+    'use strict';
 
-const DEFAULT_SETTINGS = {
-    enabled: true,
-    displayMode: 'floating',
-    visibleCount: 5,
-    items: [
-        { id: 'continue', name: '继续', text: '请继续当前剧情。', group: '常用' },
-        { id: 'describe', name: '细节', text: '请详细描写当前场景、人物动作、神态与环境细节。', group: '剧情' },
-        { id: 'ooc', name: 'OOC', text: 'OOC：', group: 'OOC' },
-    ],
-};
-
-let settings;
-let currentPage = 0;
-let searchQuery = '';
-let activeGroup = '全部';
-let dragItemId = null;
-
-function cloneDefaults() {
-    return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
-}
-
-function makeId() {
-    return globalThis.crypto?.randomUUID?.() || 'qcb-' + Date.now() + '-' + Math.random().toString(36).slice(2);
-}
-
-function getSettings() {
-    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
-    if (!extensionSettings[MODULE_NAME]) {
-        extensionSettings[MODULE_NAME] = cloneDefaults();
-        saveSettingsDebounced();
-    }
-
-    settings = extensionSettings[MODULE_NAME];
-
-    if (!Array.isArray(settings.items)) settings.items = [];
-    settings.items.forEach(item => {
-        if (!item.id) item.id = makeId();
-        if (typeof item.name !== 'string') item.name = '';
-        if (typeof item.text !== 'string') item.text = '';
-        if (typeof item.group !== 'string' || !item.group.trim()) item.group = '常用';
-    });
-    if (!Number.isFinite(settings.visibleCount)) settings.visibleCount = 5;
-    settings.visibleCount = Math.max(1, Math.min(12, Number(settings.visibleCount) || 5));
-    if (!['floating', 'always', 'settings'].includes(settings.displayMode)) settings.displayMode = 'floating';
-    if (typeof settings.enabled !== 'boolean') settings.enabled = true;
-
-    return settings;
-}
-
-function save() {
-    SillyTavern.getContext().saveSettingsDebounced();
-}
-
-function findInput() {
-    const selectors = [
-        '#send_textarea',
-        '#send_form textarea',
-        '#send_form input[type="text"]',
-        'textarea[placeholder*="输入"]',
-        'textarea',
+    const MODULE = 'user-persona-forge';
+    const DEFAULT_CATEGORIES = [
+        '基础档案', '外貌特征', '性格内核', '身世经历', '身份职业',
+        '行为习惯', '偏好禁忌', '能力资源', '关系网络', '当前处境', '补充设定'
+    ];
+    const FIELD_TEMPLATES = [
+        ['基础档案', '姓名'], ['基础档案', '年龄'], ['基础档案', '生日'],
+        ['基础档案', '性别与代词'], ['基础档案', '身高'], ['基础档案', '体重'],
+        ['基础档案', '身份称谓'], ['外貌特征', '外貌概述'], ['外貌特征', '发色与瞳色'],
+        ['外貌特征', '体态与体征'], ['外貌特征', '声音与气味'], ['性格内核', '核心性格'],
+        ['性格内核', '性格反差'], ['性格内核', '价值观与底线'], ['性格内核', '欲望与恐惧'],
+        ['身世经历', '出身与家庭'], ['身世经历', '成长经历'], ['身世经历', '关键事件'],
+        ['身份职业', '职业与社会身份'], ['身份职业', '所属组织 / 阵营'],
+        ['行为习惯', '日常习惯'], ['行为习惯', '说话方式'], ['偏好禁忌', '喜好与厌恶'],
+        ['偏好禁忌', '雷点与禁忌'], ['能力资源', '能力与特长'], ['能力资源', '弱点与限制'],
+        ['关系网络', '重要关系'], ['关系网络', '与 {{char}} 的关系'], ['当前处境', '当前目标'],
+        ['当前处境', '现阶段处境'], ['补充设定', '其他补充']
     ];
 
-    for (const selector of selectors) {
-        const el = document.querySelector(selector);
-        if (el && !el.disabled && el.offsetParent !== null) return el;
-    }
-    return null;
-}
+    let settings;
+    let panel;
+    let activeTab = 'library';
+    let activeCategory = '全部';
+    let searchText = '';
+    let editingBlock = null;
+    let returnTab = 'library';
+    let observer = null;
+    const selectedLibraryIds = new Set();
+    const selectedMaskIds = new Set();
 
-function insertText(text) {
-    const input = findInput();
-    if (!input) {
-        toastr.warning('没有找到酒馆输入框。');
-        return;
-    }
+    const clone = value => JSON.parse(JSON.stringify(value));
+    const makeId = () => (globalThis.crypto?.randomUUID?.() || 'upf-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+    const ctx = () => {
+        try { return window.SillyTavern?.getContext?.() || window.parent?.SillyTavern?.getContext?.() || null; }
+        catch (_) { return null; }
+    };
 
-    const value = input.value ?? '';
-    let insertion = String(text ?? '');
+    function getSettings() {
+        const context = ctx();
+        const store = context?.extensionSettings || window.extension_settings;
+        if (store) {
+            if (!store[MODULE]) {
+                store[MODULE] = { blocks: [], masks: [], categories: clone(DEFAULT_CATEGORIES), builderIds: [] };
+            }
+            settings = store[MODULE];
+        } else {
+            try {
+                settings = JSON.parse(localStorage.getItem(MODULE) || 'null') ||
+                    { blocks: [], masks: [], categories: clone(DEFAULT_CATEGORIES), builderIds: [] };
+            } catch (_) {
+                settings = { blocks: [], masks: [], categories: clone(DEFAULT_CATEGORIES), builderIds: [] };
+            }
+        }
 
-    if (value.length > 0 && !value.endsWith('\n')) {
-        insertion = '\n\n' + insertion;
-    }
-
-    const start = input.selectionStart ?? value.length;
-    const end = input.selectionEnd ?? value.length;
-    const nextValue = value.slice(0, start) + insertion + value.slice(end);
-    const caret = start + insertion.length;
-
-    input.focus();
-    input.value = nextValue;
-    input.setSelectionRange(caret, caret);
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-}
-
-function getGroups() {
-    return [...new Set(settings.items.map(item => (item.group || '常用').trim() || '常用'))].sort((a, b) => a.localeCompare(b, 'zh-CN'));
-}
-
-function getFilteredItems() {
-    const query = searchQuery.trim().toLowerCase();
-    return settings.items.filter(item => {
-        const group = (item.group || '常用').trim() || '常用';
-        const haystack = [item.name, item.text, group].join('\n').toLowerCase();
-        const matchesSearch = !query || haystack.includes(query);
-        const matchesGroup = activeGroup === '全部' || group === activeGroup;
-        return matchesSearch && matchesGroup;
-    });
-}
-
-function pageCount() {
-    const count = Math.max(1, Number(settings.visibleCount) || 5);
-    return Math.max(1, Math.ceil(getFilteredItems().length / count));
-}
-
-function clampPage() {
-    currentPage = Math.min(currentPage, pageCount() - 1);
-    if (currentPage < 0) currentPage = 0;
-}
-
-function createPopupControls(root) {
-    const search = root.querySelector('.qcb-search');
-    const group = root.querySelector('.qcb-group');
-
-    search.value = searchQuery;
-    if (!search.dataset.bound) {
-        search.dataset.bound = '1';
-        search.addEventListener('input', () => {
-            searchQuery = search.value;
-            currentPage = 0;
-            renderBar();
+        if (!Array.isArray(settings.blocks)) settings.blocks = [];
+        if (!Array.isArray(settings.masks)) settings.masks = [];
+        if (!Array.isArray(settings.categories)) settings.categories = clone(DEFAULT_CATEGORIES);
+        if (!Array.isArray(settings.builderIds)) settings.builderIds = [];
+        DEFAULT_CATEGORIES.forEach(name => {
+            if (!settings.categories.includes(name)) settings.categories.push(name);
         });
-    }
-
-    group.replaceChildren();
-    const all = document.createElement('option');
-    all.value = '全部';
-    all.textContent = '全部';
-    group.appendChild(all);
-
-    getGroups().forEach(name => {
-        const option = document.createElement('option');
-        option.value = name;
-        option.textContent = name;
-        group.appendChild(option);
-    });
-    group.value = activeGroup;
-    if (!group.value) {
-        activeGroup = '全部';
-        group.value = '全部';
-    }
-    if (!group.dataset.bound) {
-        group.dataset.bound = '1';
-        group.addEventListener('change', () => {
-            activeGroup = group.value;
-            currentPage = 0;
-            renderBar();
+        settings.blocks.forEach(block => {
+            if (!block.id) block.id = makeId();
+            block.title = String(block.title ?? '未命名区块');
+            block.content = String(block.content ?? '');
+            block.category = String(block.category ?? '补充设定');
+            block.tags = Array.isArray(block.tags) ? [...new Set(block.tags.map(tag => String(tag).trim()).filter(Boolean))] : [];
+            if (!settings.categories.includes(block.category)) settings.categories.push(block.category);
         });
-    }
-}
-
-function moveItemBefore(draggedId, targetId) {
-    if (!draggedId || !targetId || draggedId === targetId) return;
-    const from = settings.items.findIndex(item => item.id === draggedId);
-    const to = settings.items.findIndex(item => item.id === targetId);
-    if (from < 0 || to < 0) return;
-
-    const [moved] = settings.items.splice(from, 1);
-    settings.items.splice(to, 0, moved);
-    save();
-    renderBar();
-    renderSettingsList();
-}
-
-function renderBar() {
-    clampPage();
-    const root = document.querySelector('#quick-command-bar');
-    if (!root) return;
-
-    const list = root.querySelector('.qcb-items');
-    if (!list) return;
-
-    const popup = root.classList.contains('qcb-floating');
-    if (popup) createPopupControls(root);
-
-    list.replaceChildren();
-
-    const count = Math.max(1, Number(settings.visibleCount) || 5);
-    const filtered = getFilteredItems();
-    const startIndex = currentPage * count;
-    const pageItems = filtered.slice(startIndex, startIndex + count);
-
-    if (!pageItems.length) {
-        const empty = document.createElement('div');
-        empty.className = 'qcb-empty';
-        empty.textContent = settings.items.length ? '没有匹配的快捷项' : '还没有快捷项';
-        list.appendChild(empty);
+        settings.masks.forEach(mask => {
+            if (!mask.id) mask.id = makeId();
+            if (!Array.isArray(mask.blockIds)) mask.blockIds = [];
+        });
+        settings.builderIds = settings.builderIds.filter(id => settings.blocks.some(block => block.id === id));
+        return settings;
     }
 
-    for (const item of pageItems) {
-        const row = document.createElement('div');
-        row.className = 'qcb-row';
-        row.dataset.itemId = item.id;
-        row.draggable = true;
-        row.title = '拖动可排序';
+    function save() {
+        const context = ctx();
+        if (context?.extensionSettings) {
+            if (typeof context.saveSettingsDebounced === 'function') {
+                context.saveSettingsDebounced();
+            } else {
+                console.error('[User 面具工坊] 已连接 SillyTavern extensionSettings，但 saveSettingsDebounced 不可用；本次修改可能无法持久保存。');
+                notify('酒馆设置保存接口不可用，请检查 SillyTavern 版本。', 'error');
+            }
+            return;
+        }
+        try {
+            localStorage.setItem(MODULE, JSON.stringify(settings));
+        } catch (error) {
+            console.warn('[User 面具工坊] 保存失败', error);
+            notify('资料库保存失败，请检查浏览器存储空间。', 'error');
+        }
+    }
 
-        row.addEventListener('dragstart', event => {
-            dragItemId = item.id;
-            row.classList.add('qcb-dragging');
+    function notify(message, type) {
+        const method = window.toastr?.[type || 'info'];
+        if (typeof method === 'function') method(message);
+        else console[(type === 'error' ? 'error' : 'log')]('[User 面具工坊] ' + message);
+    }
+
+    function getBlock(id) {
+        return settings.blocks.find(block => block.id === id);
+    }
+
+    function getBuilderBlocks() {
+        return settings.builderIds.map(getBlock).filter(Boolean);
+    }
+
+    function buildOutputForIds(ids) {
+        const lines = [];
+        let lastCategory = null;
+        (ids || []).map(getBlock).filter(Boolean).forEach(block => {
+            const content = String(block.content || '').trim();
+            if (!content) return;
+            if (block.category !== lastCategory) {
+                if (lines.length) lines.push('');
+                lines.push('【' + block.category + '】');
+                lastCategory = block.category;
+            }
+            lines.push(block.title ? (content.includes('\n') ? block.title + '\n' + content : block.title + '：' + content) : content);
+        });
+        return lines.join('\n');
+    }
+
+    function buildOutput() {
+        return buildOutputForIds(settings.builderIds);
+    }
+
+    function ensurePanel() {
+        if (panel) return panel;
+        panel = document.createElement('div');
+        panel.id = 'upf-root';
+        panel.innerHTML =
+            '<div class="upf-backdrop" data-action="close"></div>' +
+            '<section class="upf-window" role="dialog" aria-modal="true" aria-label="User 面具工坊">' +
+                '<header class="upf-header">' +
+                    '<div class="upf-brand"><span class="upf-brand-mark">U</span><div><strong>User 面具工坊</strong><small>PERSONA COMPOSER · 区块化人设管理</small></div></div>' +
+                    '<div class="upf-header-actions"><span class="upf-save-state">本地资料库 · 自动保存</span><button class="upf-icon-btn" data-action="close" aria-label="关闭">×</button></div>' +
+                '</header>' +
+                '<nav class="upf-tabs">' +
+                    '<button data-action="tab" data-tab="library">区块库 <span class="upf-tab-count" id="upf-block-count">0</span></button>' +
+                    '<button data-action="tab" data-tab="compose">合成台 <span class="upf-tab-count" id="upf-builder-count">0</span></button>' +
+                    '<button data-action="tab" data-tab="masks">已保存面具 <span class="upf-tab-count" id="upf-mask-count">0</span></button>' +
+                    '<span class="upf-tab-spacer"></span>' +
+                    '<button class="upf-subtle-tab" data-action="export-library">备份资料库</button>' +
+                    '<button class="upf-subtle-tab" data-action="import-library">导入备份</button>' +
+                '</nav>' +
+                '<main class="upf-body"></main>' +
+            '</section>';
+        document.body.appendChild(panel);
+
+        panel.addEventListener('click', onPanelClick);
+        panel.addEventListener('input', onPanelInput);
+        panel.addEventListener('dragstart', onBuilderDragStart);
+        panel.addEventListener('dragover', onBuilderDragOver);
+        panel.addEventListener('drop', onBuilderDrop);
+        panel.addEventListener('dragend', onBuilderDragEnd);
+        panel.addEventListener('change', onPanelChange);
+        return panel;
+    }
+
+    function openPanel(tab) {
+        ensurePanel();
+        if (tab) activeTab = tab;
+        panel.classList.add('upf-open');
+        document.body.classList.add('upf-lock-scroll');
+        render();
+    }
+
+    function closePanel() {
+        if (!panel) return;
+        panel.classList.remove('upf-open');
+        document.body.classList.remove('upf-lock-scroll');
+        editingBlock = null;
+    }
+
+    function render() {
+        if (!panel) return;
+        panel.querySelectorAll('[data-tab]').forEach(button => {
+            button.classList.toggle('is-active', button.dataset.tab === activeTab);
+        });
+        panel.querySelector('#upf-block-count').textContent = String(settings.blocks.length);
+        panel.querySelector('#upf-builder-count').textContent = String(settings.builderIds.length);
+        panel.querySelector('#upf-mask-count').textContent = String(settings.masks.length);
+
+        const body = panel.querySelector('.upf-body');
+        if (editingBlock) body.innerHTML = renderEditor();
+        else if (activeTab === 'compose') body.innerHTML = renderComposer();
+        else if (activeTab === 'masks') body.innerHTML = renderMasks();
+        else body.innerHTML = renderLibrary();
+    }
+
+    function renderLibrary() {
+        const query = searchText.trim().toLocaleLowerCase();
+        const blocks = settings.blocks.filter(block => {
+            const matchesCategory = activeCategory === '全部' || block.category === activeCategory;
+            const haystack = (block.title + '\n' + block.category + '\n' + block.content + '\n' + (block.tags || []).join(' ')).toLocaleLowerCase();
+            return matchesCategory && (!query || haystack.includes(query));
+        });
+        const categories = ['全部'].concat(settings.categories);
+        const categoryHtml = categories.map(category =>
+            '<button class="upf-category ' + (activeCategory === category ? 'is-active' : '') +
+            '" data-action="category" data-category="' + esc(category) + '">' +
+            '<span>' + esc(category) + '</span><small>' +
+            (category === '全部' ? settings.blocks.length : settings.blocks.filter(item => item.category === category).length) +
+            '</small></button>'
+        ).join('');
+
+        const cards = blocks.length ? blocks.map(block => {
+            const selected = settings.builderIds.includes(block.id);
+            const preview = block.content.trim() ? block.content.trim().replace(/\s+/g, ' ').slice(0, 105) : '尚未填写内容 · 点击编辑';
+            return '<article class="upf-block-card">' +
+                '<div class="upf-block-main"><div class="upf-card-kicker">' + esc(block.category) + '</div>' +
+                '<strong>' + esc(block.title) + '</strong><p>' + esc(preview) + '</p>' +
+                ((block.tags || []).length ? '<div class="upf-tags">' + block.tags.map(tag => '<span>' + esc(tag) + '</span>').join('') + '</div>' : '') + '</div>' +
+                '<div class="upf-card-actions">' +
+                    '<label class="upf-select-check"><input type="checkbox" data-select-block="' + esc(block.id) + '" ' + (selectedLibraryIds.has(block.id) ? 'checked' : '') + '>选择</label>' +
+                    '<button class="upf-mini-btn" data-action="edit-block" data-id="' + esc(block.id) + '">编辑</button>' +
+                    '<button class="upf-mini-btn upf-danger" data-action="delete-block" data-id="' + esc(block.id) + '">删除</button>' +
+                    '<button class="upf-add-btn ' + (selected ? 'is-added' : '') + '" data-action="' + (selected ? 'remove-block' : 'add-block') +
+                    '" data-id="' + esc(block.id) + '">' + (selected ? '已加入 ✓' : '加入合成 +') + '</button>' +
+                '</div></article>';
+        }).join('') : '<div class="upf-empty"><span class="upf-empty-symbol">＋</span><strong>' +
+            (settings.blocks.length ? '没有找到匹配的区块' : '这里还没有资料区块') +
+            '</strong><p>' + (settings.blocks.length ? '换个关键词或分类试试。' : '从常用字段开始，逐步建立自己的 User 资料库。') +
+            '</p><button class="upf-primary-btn" data-action="new-block">新建第一个区块</button></div>';
+
+        return '<div class="upf-toolbar">' +
+            '<div><div class="upf-eyebrow">01 / LIBRARY</div><h2>资料区块库</h2><p>每一块资料都能独立保存，也可以反复加入不同面具。</p></div>' +
+            '<div class="upf-toolbar-actions"><button class="upf-secondary-btn" data-action="create-fields">生成常用字段</button>' +
+            '<button class="upf-primary-btn" data-action="new-block">＋ 新建区块</button></div></div>' +
+            '<div class="upf-library-batch"><span>已选 ' + selectedLibraryIds.size + ' 个区块</span><button class="upf-secondary-btn" data-action="select-visible">全选当前结果</button><button class="upf-text-btn" data-action="clear-library-selection">清除选择</button><button class="upf-primary-btn" data-action="batch-add-blocks" ' + (selectedLibraryIds.size ? '' : 'disabled') + '>批量加入合成台</button></div>' +
+            '<div class="upf-library-layout"><aside class="upf-category-rail"><div class="upf-rail-title">资料分类</div>' +
+            categoryHtml +
+            (activeCategory !== '全部' && !DEFAULT_CATEGORIES.includes(activeCategory) ? '<div class="upf-category-manage"><button data-action="rename-category" data-category="' + esc(activeCategory) + '">重命名当前分类</button><button data-action="delete-category" data-category="' + esc(activeCategory) + '">删除当前分类</button></div>' : '') +
+            '<button class="upf-add-category" data-action="add-category">＋ 新增分类</button></aside>' +
+            '<section class="upf-library-content"><div class="upf-search-row"><input class="upf-search" type="search" placeholder="搜索区块名称、分类或内容…" value="' + esc(searchText) + '">' +
+            '<span class="upf-result-count">' + blocks.length + ' / ' + settings.blocks.length + ' 个区块</span></div>' +
+            '<div class="upf-block-list">' + cards + '</div></section></div>';
+    }
+
+    function renderComposer() {
+        const blocks = getBuilderBlocks();
+        const output = buildOutput();
+        const rows = blocks.length ? blocks.map((block, index) =>
+            '<article class="upf-builder-row" draggable="true" data-drag-id="' + esc(block.id) + '"><div class="upf-order"><span class="upf-drag-grip" aria-label="拖拽排序">⠿</span>' + String(index + 1).padStart(2, '0') + '</div>' +
+            '<div class="upf-builder-info"><strong>' + esc(block.title) + '</strong><small>' + esc(block.category) +
+            (block.content.trim() ? '' : ' · 空内容') + '</small></div>' +
+            '<div class="upf-builder-actions"><button data-action="move-block" data-id="' + esc(block.id) + '" data-dir="-1" ' + (index === 0 ? 'disabled' : '') + ' title="上移">↑</button>' +
+            '<button data-action="move-block" data-id="' + esc(block.id) + '" data-dir="1" ' + (index === blocks.length - 1 ? 'disabled' : '') + ' title="下移">↓</button>' +
+            '<button data-action="edit-block" data-id="' + esc(block.id) + '" title="编辑">✎</button>' +
+            '<button data-action="remove-block" data-id="' + esc(block.id) + '" title="移出合成">×</button></div></article>'
+        ).join('') : '<div class="upf-builder-empty"><strong>合成台还是空的</strong><p>去区块库挑选资料，按需要拼成一份 User Persona。</p><button class="upf-primary-btn" data-action="tab" data-tab="library">前往区块库</button></div>';
+
+        return '<div class="upf-toolbar"><div><div class="upf-eyebrow">02 / COMPOSER</div><h2>面具合成台</h2><p>选择需要的资料区块，调整顺序，右侧会同步生成最终文本。</p></div>' +
+            '<div class="upf-toolbar-actions"><button class="upf-secondary-btn" data-action="clear-builder">清空合成台</button>' +
+            '<button class="upf-primary-btn" data-action="save-mask" ' + (blocks.length ? '' : 'disabled') + '>保存为面具</button></div></div>' +
+            '<div class="upf-compose-layout"><section class="upf-builder-panel"><div class="upf-section-head"><div><span>ASSEMBLED PARTS</span><strong>已选区块</strong></div><b>' + blocks.length + '</b></div>' +
+            '<div class="upf-builder-list">' + rows + '</div><button class="upf-wide-ghost" data-action="tab" data-tab="library">＋ 继续添加资料区块</button></section>' +
+            '<section class="upf-preview-panel"><div class="upf-section-head"><div><span>LIVE PREVIEW</span><strong>人设预览</strong></div><b>' + (output ? output.length + ' 字符' : '空白') + '</b></div>' +
+            '<div class="upf-preview-paper">' + (output ? '<pre>' + esc(output) + '</pre>' : '<div class="upf-preview-empty">选择并填写区块后，完整的人设文本会显示在这里。</div>') + '</div>' +
+            '<div class="upf-output-actions"><button class="upf-primary-btn" data-action="copy-output" ' + (output ? '' : 'disabled') + '>复制合成文本</button>' +
+            '<button class="upf-secondary-btn" data-action="apply-output" ' + (output ? '' : 'disabled') + '>写入当前人设</button>' +
+            '<button class="upf-text-btn" data-action="download-output" ' + (output ? '' : 'disabled') + '>导出 TXT</button></div>' +
+            '<p class="upf-safe-note">写入操作只替换当前 Persona 的描述文本，不会改动人设名称、头像或绑定关系。</p></section></div>';
+    }
+
+    function renderMasks() {
+        const cards = settings.masks.length ? settings.masks.map(mask => {
+            const maskOutput = buildOutputForIds(mask.blockIds || []);
+            const missing = (mask.blockIds || []).filter(blockId => !getBlock(blockId)).length;
+            return '<article class="upf-mask-card"><label class="upf-select-check"><input type="checkbox" data-select-mask="' + esc(mask.id) + '" ' + (selectedMaskIds.has(mask.id) ? 'checked' : '') + '>选择</label><div class="upf-mask-symbol">M</div><div class="upf-mask-info"><strong>' + esc(mask.name) +
+                '</strong><p>' + (mask.blockIds || []).length + ' 个区块 · ' + (maskOutput ? maskOutput.length + ' 字符' : '暂无可输出内容') +
+                (missing ? ' · ' + missing + ' 个区块已不存在' : '') + ' · 保存于 ' + esc(mask.updatedAt ? new Date(mask.updatedAt).toLocaleDateString() : '未知日期') +
+                '</p></div><div class="upf-mask-actions"><button class="upf-secondary-btn" data-action="load-mask" data-id="' + esc(mask.id) + '">载入</button>' +
+                '<button data-action="rename-mask" data-id="' + esc(mask.id) + '" title="重命名">✎</button><button data-action="duplicate-mask" data-id="' + esc(mask.id) + '" title="复制方案">⧉</button>' +
+                '<button data-action="delete-mask" data-id="' + esc(mask.id) + '" title="删除方案">×</button></div>' +
+                '<details class="upf-mask-preview"><summary>预览这套面具</summary><pre>' + esc(maskOutput || '这套面具目前没有可输出的文字。') + '</pre></details></article>';
+        }).join('') : '<div class="upf-empty"><span class="upf-empty-symbol">M</span><strong>还没有保存的面具</strong><p>把区块加入合成台、调整好顺序，然后保存为一套可重复使用的方案。</p>' +
+            '<button class="upf-primary-btn" data-action="tab" data-tab="compose">前往合成台</button></div>';
+
+        return '<div class="upf-toolbar"><div><div class="upf-eyebrow">03 / MASK COLLECTION</div><h2>已保存的面具</h2><p>一套面具只保存区块组合关系，不会复制素材；修改区块后，相关方案也会使用最新内容。</p></div>' +
+            '<div class="upf-toolbar-actions"><button class="upf-secondary-btn" data-action="export-library">导出完整资料库</button></div></div>' +
+            '<div class="upf-mask-batch"><span>已选 ' + selectedMaskIds.size + ' 套面具</span><button class="upf-secondary-btn" data-action="clear-mask-selection">清除选择</button><button class="upf-primary-btn" data-action="merge-masks" ' + (selectedMaskIds.size ? '' : 'disabled') + '>合并所选面具到合成台</button></div>' +
+            '<div class="upf-mask-list">' + cards + '</div>';
+    }
+
+    function renderEditor() {
+        const block = editingBlock || {};
+        const categories = settings.categories.map(category =>
+            '<option value="' + esc(category) + '" ' + (block.category === category ? 'selected' : '') + '>' + esc(category) + '</option>'
+        ).join('');
+        return '<div class="upf-editor-wrap"><div class="upf-editor-top"><button class="upf-back-btn" data-action="cancel-edit">← 返回区块库</button>' +
+            '<span class="upf-eyebrow">BLOCK EDITOR</span></div><div class="upf-editor-card"><div class="upf-eyebrow">' +
+            (block.id ? 'EDIT EXISTING BLOCK' : 'CREATE NEW BLOCK') + '</div><h2>' + (block.id ? '编辑资料区块' : '新建资料区块') + '</h2>' +
+            '<label>区块名称<input id="upf-edit-title" maxlength="80" value="' + esc(block.title || '') + '" placeholder="例如：姓名、身高与体重、性格核心"></label>' +
+            '<label>所属分类<div class="upf-category-select-row"><select id="upf-edit-category">' + categories + '</select><button class="upf-secondary-btn" data-action="add-category">新增分类</button></div></label>' +
+            '<label>标签（用逗号分隔）<input id="upf-edit-tags" maxlength="300" value="' + esc((block.tags || []).join(', ')) + '" placeholder="例如：现代、日常、重要关系"></label>' +
+            '<label>资料内容<textarea id="upf-edit-content" rows="10" placeholder="写下这一块资料。可以是简短字段，也可以是完整段落；支持换行。">' + esc(block.content || '') + '</textarea></label>' +
+            '<label class="upf-checkline"><input id="upf-add-after-save" type="checkbox" ' + (block.id && settings.builderIds.includes(block.id) ? 'checked' : 'checked') + '> 保存后加入当前合成台</label>' +
+            '<div class="upf-editor-footer"><button class="upf-secondary-btn" data-action="cancel-edit">取消</button><button class="upf-primary-btn" data-action="save-block">保存区块</button></div></div></div>';
+    }
+
+    function startEdit(id) {
+        const block = id ? getBlock(id) : null;
+        returnTab = activeTab;
+        editingBlock = block ? clone(block) : { id: '', title: '', category: activeCategory === '全部' ? '基础档案' : activeCategory, content: '' };
+        activeTab = 'library';
+        render();
+    }
+
+    function saveBlock() {
+        const title = panel.querySelector('#upf-edit-title')?.value.trim();
+        const category = panel.querySelector('#upf-edit-category')?.value || '补充设定';
+        const content = panel.querySelector('#upf-edit-content')?.value ?? '';
+        const tags = [...new Set((panel.querySelector('#upf-edit-tags')?.value || '').split(/[,，、]/).map(tag => tag.trim()).filter(Boolean))];
+        const addToBuilder = panel.querySelector('#upf-add-after-save')?.checked ?? true;
+        if (!title) {
+            notify('请先填写区块名称。', 'warning');
+            panel.querySelector('#upf-edit-title')?.focus();
+            return;
+        }
+        if (!settings.categories.includes(category)) settings.categories.push(category);
+
+        let block = editingBlock.id ? getBlock(editingBlock.id) : null;
+        if (block) {
+            block.title = title;
+            block.category = category;
+            block.content = content;
+            block.tags = tags;
+            block.updatedAt = new Date().toISOString();
+        } else {
+            block = { id: makeId(), title, category, content, tags, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+            settings.blocks.unshift(block);
+        }
+
+        if (addToBuilder && !settings.builderIds.includes(block.id)) settings.builderIds.push(block.id);
+        if (!addToBuilder) settings.builderIds = settings.builderIds.filter(id => id !== block.id);
+        editingBlock = null;
+        save();
+        activeCategory = category;
+        activeTab = returnTab;
+        render();
+        notify('资料区块已保存。', 'success');
+    }
+
+    function addBlock(id) {
+        if (!settings.builderIds.includes(id)) settings.builderIds.push(id);
+        save();
+        render();
+    }
+
+    function deleteBlock(id) {
+        const block = getBlock(id);
+        if (!block || !window.confirm('删除区块「' + block.title + '」？它也会从合成台和相关面具方案中移除。')) return;
+        settings.blocks = settings.blocks.filter(item => item.id !== id);
+        settings.builderIds = settings.builderIds.filter(item => item !== id);
+        settings.masks.forEach(mask => { mask.blockIds = mask.blockIds.filter(item => item !== id); });
+        if (editingBlock?.id === id) editingBlock = null;
+        save();
+        render();
+        notify('区块已删除。', 'success');
+    }
+
+    function removeBlock(id) {
+        settings.builderIds = settings.builderIds.filter(item => item !== id);
+        save();
+        render();
+    }
+
+    function moveBlock(id, direction) {
+        const index = settings.builderIds.indexOf(id);
+        const target = index + Number(direction);
+        if (index < 0 || target < 0 || target >= settings.builderIds.length) return;
+        const next = settings.builderIds.slice();
+        const temp = next[index];
+        next[index] = next[target];
+        next[target] = temp;
+        settings.builderIds = next;
+        save();
+        render();
+    }
+
+    function saveMask() {
+        if (!settings.builderIds.length) return;
+        const name = window.prompt('给这套 User 面具起一个名字：', '新面具');
+        if (!name || !name.trim()) return;
+        settings.masks.unshift({
+            id: makeId(),
+            name: name.trim(),
+            blockIds: settings.builderIds.slice(),
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        });
+        save();
+        activeTab = 'masks';
+        render();
+        notify('面具方案已保存。', 'success');
+    }
+
+    function loadMask(id) {
+        const mask = settings.masks.find(item => item.id === id);
+        if (!mask) return;
+        const nextIds = (mask.blockIds || []).filter(blockId => !!getBlock(blockId));
+        if (settings.builderIds.length && settings.builderIds.join('|') !== nextIds.join('|')) {
+            if (!window.confirm('载入「' + mask.name + '」会替换当前合成台的区块组合，但不会删除区块库或其他面具。继续吗？')) return;
+        }
+        settings.builderIds = nextIds;
+        save();
+        activeTab = 'compose';
+        render();
+        notify('已载入「' + mask.name + '」。', 'success');
+    }
+
+    function addCategory() {
+        const name = window.prompt('输入新的资料分类名称：');
+        if (!name || !name.trim()) return;
+        const clean = name.trim();
+        if (!settings.categories.includes(clean)) {
+            settings.categories.push(clean);
+            save();
+            if (editingBlock) {
+                const select = panel?.querySelector('#upf-edit-category');
+                if (select) {
+                    const option = document.createElement('option');
+                    option.value = clean;
+                    option.textContent = clean;
+                    option.selected = true;
+                    select.appendChild(option);
+                    return;
+                }
+            }
+            render();
+        }
+    }
+
+    function renameCategory(oldName) {
+        if (!oldName || DEFAULT_CATEGORIES.includes(oldName) || !settings.categories.includes(oldName)) return;
+        const nextName = window.prompt('将分类「' + oldName + '」重命名为：', oldName);
+        if (!nextName || !nextName.trim()) return;
+        const clean = nextName.trim();
+        if (clean !== oldName && settings.categories.includes(clean)) {
+            notify('这个分类名称已经存在。', 'warning');
+            return;
+        }
+        if (clean === oldName) return;
+        settings.categories = settings.categories.map(name => name === oldName ? clean : name);
+        settings.blocks.forEach(block => { if (block.category === oldName) block.category = clean; });
+        activeCategory = clean;
+        save(); render();
+        notify('分类已重命名，原有区块已同步更新。', 'success');
+    }
+
+    function deleteCategory(name) {
+        if (!name || DEFAULT_CATEGORIES.includes(name) || !settings.categories.includes(name)) return;
+        const count = settings.blocks.filter(block => block.category === name).length;
+        if (!window.confirm('删除分类「' + name + '」？其中 ' + count + ' 个区块会移动到「补充设定」，不会被删除。')) return;
+        settings.categories = settings.categories.filter(category => category !== name);
+        settings.blocks.forEach(block => { if (block.category === name) block.category = '补充设定'; });
+        activeCategory = '全部';
+        save(); render();
+        notify('分类已删除，原有区块已移至「补充设定」。', 'success');
+    }
+
+    function createFieldTemplates() {
+        let added = 0;
+        FIELD_TEMPLATES.forEach(([category, title]) => {
+            const exists = settings.blocks.some(block => block.category === category && block.title === title);
+            if (exists) return;
+            settings.blocks.push({ id: makeId(), title, category, content: '', tags: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+            added++;
+        });
+        save();
+        activeCategory = '全部';
+        render();
+        notify(added ? '已建立 ' + added + ' 个常用空白字段，可逐条填写。' : '常用字段已经存在，无需重复建立。', 'success');
+    }
+
+    async function copyText(text) {
+        try {
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+            } else {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.style.position = 'fixed';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                const ok = document.execCommand('copy');
+                textarea.remove();
+                if (!ok) throw new Error('clipboard unavailable');
+            }
+            notify('合成文本已复制。', 'success');
+        } catch (error) {
+            console.error('[User 面具工坊] copy failed', error);
+            notify('复制失败，请检查浏览器剪贴板权限。', 'error');
+        }
+    }
+
+    function applyToCurrentPersona() {
+        const output = buildOutput();
+        if (!output) {
+            notify('当前合成内容为空，请先填写并选择区块。', 'warning');
+            return;
+        }
+        const field = document.querySelector('#persona_description');
+        if (!(field instanceof HTMLTextAreaElement)) {
+            notify('没有找到 SillyTavern Persona 描述输入框。请确认扩展运行在酒馆主页面中。', 'warning');
+            return;
+        }
+        field.value = output;
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        if (field.value !== output) {
+            notify('Persona 描述框未能接收合成内容，请改用复制文本。', 'error');
+            return;
+        }
+        notify('内容已填入 Persona 描述框，并已触发酒馆原生 input 保存处理。', 'success');
+    }
+
+    function downloadFile(name, content, mime) {
+        const blob = new Blob([content], { type: mime || 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = name;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1200);
+    }
+
+    function exportLibrary() {
+        const payload = {
+            schema: 'user-persona-forge',
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            categories: settings.categories,
+            blocks: settings.blocks,
+            masks: settings.masks
+        };
+        downloadFile('user-persona-forge-backup.json', JSON.stringify(payload, null, 2), 'application/json;charset=utf-8');
+    }
+
+    function importLibrary() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json';
+        input.addEventListener('change', async () => {
+            const file = input.files?.[0];
+            if (!file) return;
+            try {
+                const data = JSON.parse(await file.text());
+                if (!Array.isArray(data.blocks)) throw new Error('缺少 blocks 数组');
+                if (!window.confirm('导入会覆盖当前区块库、分类与面具方案。建议先导出备份。确定继续吗？')) return;
+                settings.blocks = data.blocks.map(block => ({
+                    id: String(block.id || makeId()),
+                    title: String(block.title || '未命名区块'),
+                    category: String(block.category || '补充设定'),
+                    content: String(block.content || ''),
+                    tags: Array.isArray(block.tags) ? [...new Set(block.tags.map(tag => String(tag).trim()).filter(Boolean))] : [],
+                    createdAt: block.createdAt || new Date().toISOString(),
+                    updatedAt: block.updatedAt || new Date().toISOString()
+                }));
+                settings.categories = Array.isArray(data.categories) ? data.categories.map(String) : clone(DEFAULT_CATEGORIES);
+                settings.masks = Array.isArray(data.masks) ? data.masks.map(mask => ({
+                    id: String(mask.id || makeId()),
+                    name: String(mask.name || '未命名面具'),
+                    blockIds: Array.isArray(mask.blockIds) ? mask.blockIds.map(String) : [],
+                    createdAt: mask.createdAt || new Date().toISOString(),
+                    updatedAt: mask.updatedAt || new Date().toISOString()
+                })) : [];
+                settings.builderIds = [];
+                getSettings();
+                save();
+                render();
+                notify('资料库备份导入完成。', 'success');
+            } catch (error) {
+                console.error('[User 面具工坊] import failed', error);
+                notify('导入失败：文件不是有效的面具工坊 JSON 备份。', 'error');
+            }
+        });
+        input.click();
+    }
+
+    let draggedBlockId = null;
+
+    function onBuilderDragStart(event) {
+        const row = event.target.closest('.upf-builder-row[data-drag-id]');
+        if (!row || !panel.querySelector('.upf-builder-list')?.contains(row)) return;
+        draggedBlockId = row.dataset.dragId;
+        row.classList.add('is-dragging');
+        if (event.dataTransfer) {
             event.dataTransfer.effectAllowed = 'move';
-            event.dataTransfer.setData('text/plain', item.id);
+            event.dataTransfer.setData('text/plain', draggedBlockId);
+        }
+    }
+
+    function onBuilderDragOver(event) {
+        const row = event.target.closest('.upf-builder-row[data-drag-id]');
+        if (!draggedBlockId || !row || row.dataset.dragId === draggedBlockId) return;
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        panel.querySelectorAll('.upf-builder-row.is-drop-target').forEach(item => item.classList.remove('is-drop-target'));
+        row.classList.add('is-drop-target');
+    }
+
+    function onBuilderDrop(event) {
+        const row = event.target.closest('.upf-builder-row[data-drag-id]');
+        if (!draggedBlockId || !row) return;
+        event.preventDefault();
+        const from = settings.builderIds.indexOf(draggedBlockId);
+        const to = settings.builderIds.indexOf(row.dataset.dragId);
+        if (from < 0 || to < 0 || from === to) return;
+        const next = settings.builderIds.slice();
+        const moved = next.splice(from, 1)[0];
+        next.splice(to, 0, moved);
+        settings.builderIds = next;
+        save();
+        render();
+    }
+
+    function onBuilderDragEnd() {
+        draggedBlockId = null;
+        panel?.querySelectorAll('.upf-builder-row.is-dragging, .upf-builder-row.is-drop-target').forEach(row => {
+            row.classList.remove('is-dragging', 'is-drop-target');
         });
-        row.addEventListener('dragend', () => {
-            dragItemId = null;
-            row.classList.remove('qcb-dragging');
-        });
-        row.addEventListener('dragover', event => {
-            event.preventDefault();
-            row.classList.add('qcb-drag-over');
-        });
-        row.addEventListener('dragleave', () => row.classList.remove('qcb-drag-over'));
-        row.addEventListener('drop', event => {
-            event.preventDefault();
-            row.classList.remove('qcb-drag-over');
-            moveItemBefore(dragItemId || event.dataTransfer.getData('text/plain'), item.id);
-        });
+    }
+
+    function onPanelInput(event) {
+        if (event.target.matches('.upf-search')) {
+            searchText = event.target.value;
+            const cursor = event.target.selectionStart;
+            const value = event.target.value;
+            const body = panel.querySelector('.upf-body');
+            body.innerHTML = renderLibrary();
+            const next = body.querySelector('.upf-search');
+            if (next) {
+                next.focus();
+                next.setSelectionRange(cursor, cursor);
+            }
+        }
+    }
+
+    function onPanelChange(event) {
+        if (event.target.matches('[data-select-block]')) {
+            const id = event.target.dataset.selectBlock;
+            if (event.target.checked) selectedLibraryIds.add(id);
+            else selectedLibraryIds.delete(id);
+            const body = panel.querySelector('.upf-body');
+            body.innerHTML = renderLibrary();
+        }
+        if (event.target.matches('[data-select-mask]')) {
+            const id = event.target.dataset.selectMask;
+            if (event.target.checked) selectedMaskIds.add(id);
+            else selectedMaskIds.delete(id);
+            const body = panel.querySelector('.upf-body');
+            body.innerHTML = renderMasks();
+        }
+        if (event.target.matches('#upf-edit-category')) {
+            event.target.dataset.changed = '1';
+        }
+    }
+
+    function onPanelClick(event) {
+        const button = event.target.closest('[data-action]');
+        if (!button || !panel.contains(button)) return;
+        const action = button.dataset.action;
+        const id = button.dataset.id;
+
+        if (action === 'close') closePanel();
+        else if (action === 'tab') {
+            editingBlock = null;
+            activeTab = button.dataset.tab || 'library';
+            render();
+        }
+        else if (action === 'category') {
+            activeCategory = button.dataset.category || '全部';
+            render();
+        }
+        else if (action === 'new-block') startEdit();
+        else if (action === 'edit-block') startEdit(id);
+        else if (action === 'save-block') saveBlock();
+        else if (action === 'cancel-edit') { editingBlock = null; activeTab = returnTab; render(); }
+        else if (action === 'add-block') addBlock(id);
+        else if (action === 'select-visible') {
+            const query = searchText.trim().toLocaleLowerCase();
+            settings.blocks.filter(block => (activeCategory === '全部' || block.category === activeCategory) && (!query || (block.title + '\n' + block.category + '\n' + block.content + '\n' + (block.tags || []).join(' ')).toLocaleLowerCase().includes(query))).forEach(block => selectedLibraryIds.add(block.id));
+            render();
+        }
+        else if (action === 'clear-library-selection') { selectedLibraryIds.clear(); render(); }
+        else if (action === 'batch-add-blocks') {
+            const additions = [...selectedLibraryIds].filter(blockId => getBlock(blockId) && !settings.builderIds.includes(blockId));
+            settings.builderIds.push(...additions);
+            selectedLibraryIds.clear();
+            save(); render();
+            notify('已批量加入 ' + additions.length + ' 个区块（自动跳过重复项）。', 'success');
+        }
+        else if (action === 'remove-block') removeBlock(id);
+        else if (action === 'delete-block') deleteBlock(id);
+        else if (action === 'move-block') moveBlock(id, button.dataset.dir);
+        else if (action === 'save-mask') saveMask();
+        else if (action === 'load-mask') loadMask(id);
+        else if (action === 'clear-mask-selection') { selectedMaskIds.clear(); render(); }
+        else if (action === 'merge-masks') {
+            const merged = [];
+            settings.masks.filter(mask => selectedMaskIds.has(mask.id)).forEach(mask => (mask.blockIds || []).forEach(blockId => {
+                if (getBlock(blockId) && !merged.includes(blockId)) merged.push(blockId);
+            }));
+            const existing = new Set(settings.builderIds);
+            settings.builderIds.push(...merged.filter(blockId => !existing.has(blockId)));
+            selectedMaskIds.clear();
+            save(); activeTab = 'compose'; render();
+            notify('已合并面具区块，重复引用已自动去重。', 'success');
+        }
+        else if (action === 'add-category') addCategory();
+        else if (action === 'rename-category') renameCategory(button.dataset.category);
+        else if (action === 'delete-category') deleteCategory(button.dataset.category);
+        else if (action === 'create-fields') createFieldTemplates();
+        else if (action === 'clear-builder') {
+            if (window.confirm('清空当前合成台？区块库和已保存面具不会受到影响。')) {
+                settings.builderIds = [];
+                save();
+                render();
+            }
+        }
+        else if (action === 'copy-output') copyText(buildOutput());
+        else if (action === 'apply-output') applyToCurrentPersona();
+        else if (action === 'download-output') downloadFile('user-persona.txt', buildOutput(), 'text/plain;charset=utf-8');
+        else if (action === 'export-library') exportLibrary();
+        else if (action === 'import-library') importLibrary();
+        else if (action === 'rename-mask') {
+            const mask = settings.masks.find(item => item.id === id);
+            if (!mask) return;
+            const name = window.prompt('修改面具名称：', mask.name);
+            if (name && name.trim()) {
+                mask.name = name.trim();
+                mask.updatedAt = new Date().toISOString();
+                save();
+                render();
+            }
+        }
+        else if (action === 'duplicate-mask') {
+            const mask = settings.masks.find(item => item.id === id);
+            if (!mask) return;
+            const name = window.prompt('复制后的面具名称：', mask.name + ' - 副本');
+            if (name && name.trim()) {
+                settings.masks.unshift({ ...clone(mask), id: makeId(), name: name.trim(), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+                save();
+                render();
+            }
+        }
+        else if (action === 'delete-mask') {
+            const mask = settings.masks.find(item => item.id === id);
+            if (!mask || !window.confirm('删除面具方案「' + mask.name + '」？原始资料区块不会被删除。')) return;
+            settings.masks = settings.masks.filter(item => item.id !== id);
+            save();
+            render();
+        }
+    }
+
+    function mountLauncher() {
+        if (document.querySelector('#upf-launch')) return true;
+        const personaButton = document.querySelector('#persona-management-button');
+        const host = personaButton?.parentElement ||
+            document.querySelector('#top-bar, #top-settings-holder, #extensionsMenu');
+        if (!host) return false;
 
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'qcb-item';
-        button.title = item.text;
-        button.textContent = item.name || item.text.slice(0, 20) || '未命名';
-        button.addEventListener('click', () => {
-            insertText(item.text);
-            closeQuickBar();
-        });
+        button.id = 'upf-launch';
+        button.className = 'menu_button upf-launch';
+        button.innerHTML = '<span class="upf-launch-icon">U</span><span>面具工坊</span>';
+        button.title = '打开 User 面具工坊';
+        button.addEventListener('click', () => openPanel('library'));
 
-        const group = document.createElement('span');
-        group.className = 'qcb-item-group';
-        group.textContent = item.group || '常用';
-
-        const edit = document.createElement('button');
-        edit.type = 'button';
-        edit.className = 'qcb-edit';
-        edit.textContent = '✎';
-        edit.title = '直接编辑';
-        edit.addEventListener('click', event => {
-            event.stopPropagation();
-            openInlineEditor(item);
-        });
-
-        const remove = document.createElement('button');
-        remove.type = 'button';
-        remove.className = 'qcb-delete';
-        remove.textContent = '×';
-        remove.title = '删除';
-        remove.addEventListener('click', event => {
-            event.stopPropagation();
-            deleteItem(item.id);
-        });
-
-        const content = document.createElement('span');
-        content.className = 'qcb-item-content';
-        content.append(button, group);
-
-        row.append(content, edit, remove);
-        list.appendChild(row);
+        if (personaButton) personaButton.insertAdjacentElement('afterend', button);
+        else host.appendChild(button);
+        return true;
     }
 
-    const total = pageCount();
-    const prev = root.querySelector('.qcb-prev');
-    const next = root.querySelector('.qcb-next');
-    if (prev) prev.disabled = currentPage <= 0;
-    if (next) next.disabled = currentPage >= total - 1;
+    function init() {
+        getSettings();
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape' && panel?.classList.contains('upf-open')) closePanel();
+        });
+        if (mountLauncher()) return;
+        if (observer) observer.disconnect();
+        observer = new MutationObserver(() => {
+            if (mountLauncher()) {
+                observer.disconnect();
+                observer = null;
+            }
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+    }
 
-    const page = root.querySelector('.qcb-page');
-    if (page) page.textContent = total > 1 ? (currentPage + 1) + ' / ' + total : '';
-
-    const result = root.querySelector('.qcb-result-count');
-    if (result) result.textContent = filtered.length ? filtered.length + ' 项' : '';
-}
-
-function openInlineEditor(item) {
-    const root = document.querySelector('#quick-command-bar');
-    const row = root?.querySelector('.qcb-row[data-item-id="' + CSS.escape(item.id) + '"]');
-    if (!row) return;
-
-    row.replaceChildren();
-    row.classList.add('qcb-inline-editor');
-    row.draggable = false;
-
-    const name = document.createElement('input');
-    name.type = 'text';
-    name.value = item.name || '';
-    name.placeholder = '显示名称';
-
-    const group = document.createElement('input');
-    group.type = 'text';
-    group.value = item.group || '常用';
-    group.placeholder = '分组，例如：常用 / 剧情 / OOC';
-
-    const text = document.createElement('textarea');
-    text.rows = 4;
-    text.value = item.text || '';
-    text.placeholder = '实际插入内容';
-
-    const actions = document.createElement('div');
-    actions.className = 'qcb-inline-actions';
-
-    const saveButton = document.createElement('button');
-    saveButton.type = 'button';
-    saveButton.textContent = '保存';
-
-    const cancelButton = document.createElement('button');
-    cancelButton.type = 'button';
-    cancelButton.textContent = '取消';
-
-    saveButton.addEventListener('click', () => {
-        item.name = name.value.trim() || '未命名';
-        item.group = group.value.trim() || '常用';
-        item.text = text.value;
-        save();
-        renderSettingsList();
-        renderBar();
-    });
-
-    cancelButton.addEventListener('click', () => renderBar());
-
-    actions.append(saveButton, cancelButton);
-    row.append(name, group, text, actions);
-    name.focus();
-}
-
-function deleteItem(id) {
-    const index = settings.items.findIndex(item => item.id === id);
-    if (index < 0) return;
-
-    const item = settings.items[index];
-    if (!confirm('删除快捷项「' + (item.name || '未命名') + '」？')) return;
-
-    settings.items.splice(index, 1);
-    clampPage();
-    save();
-    renderSettingsList();
-    renderBar();
-}
-
-function closeQuickBar() {
-    document.querySelector('#quick-command-bar')?.classList.remove('qcb-open');
-}
-
-function positionQuickBar() {
-    const root = document.querySelector('#quick-command-bar.qcb-floating');
-    const trigger = document.querySelector('#qcb-trigger');
-    if (!root || !trigger) return;
-
-    const r = trigger.getBoundingClientRect();
-    const width = Math.min(340, window.innerWidth - 16);
-    let left = r.left;
-
-    if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
-    if (left < 8) left = 8;
-
-    root.style.width = width + 'px';
-    root.style.left = left + 'px';
-    root.style.bottom = Math.max(8, window.innerHeight - r.top + 8) + 'px';
-}
-
-function createFloatingBar() {
-    if (document.querySelector('#qcb-trigger')) return;
-
-    const trigger = document.createElement('button');
-    trigger.id = 'qcb-trigger';
-    trigger.type = 'button';
-    trigger.className = 'qcb-trigger';
-    trigger.title = '快捷指令';
-    trigger.setAttribute('aria-label', '快捷指令');
-    trigger.innerHTML = '<span>✦</span>';
-
-    const root = document.createElement('section');
-    root.id = 'quick-command-bar';
-    root.className = 'qcb-root qcb-floating';
-    root.innerHTML = '<div class="qcb-head"><strong>快捷指令</strong><span class="qcb-result-count"></span><button type="button" class="qcb-close">×</button></div>' +
-        '<div class="qcb-filters"><input class="qcb-search" type="search" placeholder="搜索快捷指令"><select class="qcb-group"></select></div>' +
-        '<button type="button" class="qcb-arrow qcb-prev">▲</button><div class="qcb-items"></div><button type="button" class="qcb-arrow qcb-next">▼</button>' +
-        '<span class="qcb-page"></span><div class="qcb-footer"><button type="button" class="qcb-add">＋ 新增</button><button type="button" class="qcb-export">导出</button><button type="button" class="qcb-import">导入</button></div>';
-
-    document.body.appendChild(root);
-
-    trigger.addEventListener('click', () => {
-        root.classList.toggle('qcb-open');
-        if (root.classList.contains('qcb-open')) {
-            renderBar();
-            positionQuickBar();
-            root.querySelector('.qcb-search')?.focus();
-        }
-    });
-
-    root.querySelector('.qcb-close').addEventListener('click', closeQuickBar);
-    root.querySelector('.qcb-prev').addEventListener('click', () => {
-        currentPage--;
-        renderBar();
-    });
-    root.querySelector('.qcb-next').addEventListener('click', () => {
-        currentPage++;
-        renderBar();
-    });
-    root.querySelector('.qcb-add').addEventListener('click', () => {
-        const item = { id: makeId(), name: '新快捷项', text: '', group: '常用' };
-        settings.items.push(item);
-        activeGroup = '全部';
-        searchQuery = '';
-        currentPage = pageCount() - 1;
-        save();
-        renderSettingsList();
-        renderBar();
-        openInlineEditor(item);
-    });
-
-    root.querySelector('.qcb-export').addEventListener('click', exportItems);
-    root.querySelector('.qcb-import').addEventListener('click', importItems);
-
-    const extensionsButton = document.querySelector('#extensionsMenuButton');
-    if (extensionsButton?.parentElement) {
-        extensionsButton.parentElement.insertBefore(trigger, extensionsButton);
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init, { once: true });
     } else {
-        document.body.appendChild(trigger);
+        init();
     }
-
-    renderBar();
-}
-
-function createAlwaysBar() {
-    if (document.querySelector('#quick-command-bar')) return;
-
-    const root = document.createElement('section');
-    root.id = 'quick-command-bar';
-    root.className = 'qcb-root qcb-always';
-    root.innerHTML = '<button type="button" class="qcb-arrow qcb-prev">▲</button><div class="qcb-items"></div><button type="button" class="qcb-arrow qcb-next">▼</button>';
-
-    const sendForm = document.querySelector('#send_form');
-    if (sendForm?.parentElement) sendForm.parentElement.insertBefore(root, sendForm);
-    else document.body.appendChild(root);
-
-    root.querySelector('.qcb-prev').addEventListener('click', () => {
-        currentPage--;
-        renderBar();
-    });
-    root.querySelector('.qcb-next').addEventListener('click', () => {
-        currentPage++;
-        renderBar();
-    });
-    renderBar();
-}
-
-function removeBar() {
-    document.querySelector('#qcb-trigger')?.remove();
-    document.querySelector('#quick-command-bar')?.remove();
-}
-
-function applyDisplayMode() {
-    removeBar();
-    if (!settings.enabled || settings.displayMode === 'settings') return;
-    if (settings.displayMode === 'always') createAlwaysBar();
-    else createFloatingBar();
-}
-
-function renderSettings() {
-    const host = document.querySelector('#extensions_settings2, #extensions_settings');
-    if (!host || document.querySelector('#qcb-settings')) return;
-
-    const panel = document.createElement('div');
-    panel.id = 'qcb-settings';
-    panel.className = 'qcb-settings inline-drawer';
-    panel.innerHTML = `
-      <div class="inline-drawer-toggle inline-drawer-header">
-        <b>Quick Command Bar 0.3</b>
-        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down"></div>
-      </div>
-      <div class="inline-drawer-content">
-        <label class="qcb-setting-row">
-          <input id="qcb-enabled" type="checkbox">
-          <span>启用快捷指令栏</span>
-        </label>
-
-        <label class="qcb-setting-row">
-          <span>显示方式</span>
-          <select id="qcb-mode">
-            <option value="floating">小图标：点击后弹出</option>
-            <option value="always">始终显示在输入框上方</option>
-            <option value="settings">只在扩展设置里管理</option>
-          </select>
-        </label>
-
-        <label class="qcb-setting-row">
-          <span>每页显示数量</span>
-          <input id="qcb-count" type="number" min="1" max="12" step="1">
-        </label>
-
-        <div class="qcb-manager-head">
-          <b>快捷项</b>
-          <button id="qcb-add" class="menu_button" type="button">＋ 添加</button>
-        </div>
-
-        <div id="qcb-list"></div>
-
-        <div class="qcb-data-actions">
-          <button id="qcb-export-settings" class="menu_button" type="button">导出全部</button>
-          <button id="qcb-import-settings" class="menu_button" type="button">导入 JSON</button>
-        </div>
-      </div>
-    `;
-
-    host.appendChild(panel);
-
-    panel.querySelector('.inline-drawer-toggle').addEventListener('click', () => {
-        panel.classList.toggle('open');
-        panel.querySelector('.inline-drawer-content').style.display =
-            panel.classList.contains('open') ? 'block' : '';
-    });
-
-    const enabled = panel.querySelector('#qcb-enabled');
-    enabled.checked = settings.enabled;
-    enabled.addEventListener('change', () => {
-        settings.enabled = enabled.checked;
-        applyDisplayMode();
-        save();
-    });
-
-    const mode = panel.querySelector('#qcb-mode');
-    mode.value = settings.displayMode;
-    mode.addEventListener('change', () => {
-        settings.displayMode = mode.value;
-        currentPage = 0;
-        applyDisplayMode();
-        save();
-    });
-
-    const count = panel.querySelector('#qcb-count');
-    count.value = settings.visibleCount;
-    count.addEventListener('change', () => {
-        settings.visibleCount = Math.max(1, Math.min(12, Number(count.value) || 5));
-        currentPage = 0;
-        renderBar();
-        save();
-    });
-
-    panel.querySelector('#qcb-add').addEventListener('click', () => {
-        settings.items.push({
-            id: makeId(),
-            name: '新快捷项',
-            text: '',
-            group: '常用',
-        });
-        currentPage = 0;
-        renderSettingsList();
-        renderBar();
-        save();
-    });
-
-    panel.querySelector('#qcb-export-settings').addEventListener('click', exportItems);
-    panel.querySelector('#qcb-import-settings').addEventListener('click', importItems);
-
-    renderSettingsList();
-}
-
-function renderSettingsList() {
-    const list = document.querySelector('#qcb-list');
-    if (!list) return;
-    list.replaceChildren();
-
-    settings.items.forEach((item, index) => {
-        const row = document.createElement('div');
-        row.className = 'qcb-edit-row';
-        row.dataset.itemId = item.id;
-
-        const name = document.createElement('input');
-        name.className = 'qcb-name';
-        name.type = 'text';
-        name.placeholder = '显示名称';
-        name.value = item.name ?? '';
-
-        const group = document.createElement('input');
-        group.className = 'qcb-group-input';
-        group.type = 'text';
-        group.placeholder = '分组，例如：常用 / 剧情 / OOC';
-        group.value = item.group ?? '常用';
-
-        const text = document.createElement('textarea');
-        text.className = 'qcb-text';
-        text.rows = 3;
-        text.placeholder = '点击按钮后实际插入的文字';
-        text.value = item.text ?? '';
-
-        const actions = document.createElement('div');
-        actions.className = 'qcb-edit-actions';
-
-        const up = document.createElement('button');
-        up.type = 'button';
-        up.className = 'menu_button qcb-up';
-        up.title = '上移';
-        up.textContent = '↑';
-
-        const down = document.createElement('button');
-        down.type = 'button';
-        down.className = 'menu_button qcb-down';
-        down.title = '下移';
-        down.textContent = '↓';
-
-        const del = document.createElement('button');
-        del.type = 'button';
-        del.className = 'menu_button qcb-delete';
-        del.title = '删除';
-        del.textContent = '删除';
-
-        actions.append(up, down, del);
-        row.append(name, group, text, actions);
-
-        name.addEventListener('input', () => {
-            item.name = name.value;
-            renderBar();
-            save();
-        });
-        group.addEventListener('input', () => {
-            item.group = group.value.trim() || '常用';
-            renderBar();
-            save();
-        });
-        text.addEventListener('input', () => {
-            item.text = text.value;
-            renderBar();
-            save();
-        });
-
-        up.addEventListener('click', () => {
-            if (index <= 0) return;
-            [settings.items[index - 1], settings.items[index]] =
-                [settings.items[index], settings.items[index - 1]];
-            renderSettingsList();
-            renderBar();
-            save();
-        });
-
-        down.addEventListener('click', () => {
-            if (index >= settings.items.length - 1) return;
-            [settings.items[index + 1], settings.items[index]] =
-                [settings.items[index], settings.items[index + 1]];
-            renderSettingsList();
-            renderBar();
-            save();
-        });
-
-        del.addEventListener('click', () => deleteItem(item.id));
-
-        list.appendChild(row);
-    });
-}
-
-function exportItems() {
-    const payload = {
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        items: settings.items,
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'quick-command-bar.json';
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function importItems() {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.json,application/json';
-
-    input.addEventListener('change', async () => {
-        const file = input.files?.[0];
-        if (!file) return;
-
-        try {
-            const data = JSON.parse(await file.text());
-            const items = Array.isArray(data) ? data : data.items;
-            if (!Array.isArray(items)) throw new Error('JSON 中没有 items 数组');
-
-            settings.items = items.map(raw => ({
-                id: raw.id || makeId(),
-                name: String(raw.name ?? '未命名'),
-                text: String(raw.text ?? ''),
-                group: String(raw.group ?? '常用').trim() || '常用',
-            }));
-
-            currentPage = 0;
-            searchQuery = '';
-            activeGroup = '全部';
-            save();
-            renderSettingsList();
-            renderBar();
-            toastr.success('快捷指令已导入。');
-        } catch (error) {
-            console.error('[Quick Command Bar] import failed', error);
-            toastr.error('导入失败：JSON 格式不正确。');
-        }
-    });
-
-    input.click();
-}
-
-async function init() {
-    getSettings();
-
-    const start = Date.now();
-    const timer = setInterval(() => {
-        const sendForm = document.querySelector('#send_form');
-        const settingsHost = document.querySelector('#extensions_settings2, #extensions_settings');
-
-        if (sendForm && !document.querySelector('#qcb-trigger, #quick-command-bar')) applyDisplayMode();
-        if (settingsHost) renderSettings();
-
-        if ((sendForm && settingsHost) || Date.now() - start > 10000) {
-            clearInterval(timer);
-        }
-    }, 250);
-
-    document.addEventListener('click', event => {
-        const root = document.querySelector('#quick-command-bar');
-        const trigger = document.querySelector('#qcb-trigger');
-        if (root?.classList.contains('qcb-open') &&
-            !root.contains(event.target) &&
-            !trigger?.contains(event.target)) {
-            closeQuickBar();
-        }
-    });
-
-    let touchStartY = null;
-    document.addEventListener('touchstart', event => {
-        if (!document.querySelector('#quick-command-bar.qcb-open')) return;
-        touchStartY = event.touches[0]?.clientY ?? null;
-    }, { passive: true });
-
-    document.addEventListener('touchend', event => {
-        if (touchStartY === null) return;
-        const endY = event.changedTouches[0]?.clientY ?? touchStartY;
-        const delta = endY - touchStartY;
-        touchStartY = null;
-        if (Math.abs(delta) < 45) return;
-
-        const root = document.querySelector('#quick-command-bar.qcb-open');
-        if (!root) return;
-
-        if (delta < 0) {
-            currentPage++;
-        } else {
-            currentPage--;
-        }
-        renderBar();
-    }, { passive: true });
-
-    window.addEventListener('resize', positionQuickBar);
-    window.addEventListener('scroll', positionQuickBar, true);
-}
-
-$(init);
+})();
