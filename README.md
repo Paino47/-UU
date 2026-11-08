@@ -1,23 +1,49 @@
-# SillyTavern Quick Command Bar
+# User 面具工坊
 
-V0.1.0 — a theme-neutral SillyTavern UI extension.
+SillyTavern 第三方 UI 扩展：将 User Persona 拆分为可复用的资料区块，再按不同角色、世界观和剧情组合成多套面具方案。
 
-## Features
+## 功能
 
-- A vertical shortcut bar placed near the chat input.
-- Up/down page navigation.
-- User-defined display name + inserted text.
-- Click inserts text into the current input box without sending.
-- Automatically inserts a blank line before the shortcut when existing text is present.
-- Add, edit, delete, move up/down.
-- Persists through SillyTavern extension settings.
-- Desktop/mobile responsive.
-- No server plugin required.
+- **区块库**：自由新建、编辑、删除和分类资料区块；支持按名称、分类、内容与标签搜索。
+- **标签与分类**：区块可添加多个标签；自定义分类可重命名或删除，删除分类时其中的区块会转移到“补充设定”，不会被删除。
+- **常用字段模板**：一键建立姓名、年龄、身高体重、性格、身世经历等空白字段。
+- **批量操作**：全选当前筛选结果或手动勾选区块，批量加入合成台，并自动跳过重复项。
+- **合成台**：从区块库挑选素材，支持拖拽排序和上下移动，实时预览最终 User Persona 文本。
+- **面具方案**：保存多套组合，例如现代日常、古风架空、校园身份或特殊剧情身份；可载入、复制、重命名、删除，也可合并多套面具。
+- **导入 / 导出**：将完整区块库与面具方案备份为 JSON，也可导出当前合成文本。
+- **写入当前 Persona**：将预览文本写入 SillyTavern 当前人设的描述框，并触发原生输入保存逻辑。只修改描述，不修改 Persona 名称、头像或绑定关系。
 
-## Install from GitHub
+## 数据保存
 
-In SillyTavern: Extensions → Install Extension → paste this repository URL.
+区块库、面具方案和当前合成顺序保存在 SillyTavern 的扩展设置中，并通过扩展设置保存机制持久化。建议定期导出 JSON 备份。
 
-## V0.1 limitations
+## 安装
 
-This version deliberately keeps styling neutral. It does not attempt to follow a specific theme.
+本仓库根目录就是扩展本体，包含 `manifest.json`、`index.js` 和 `style.css`。
+
+将本仓库克隆到 SillyTavern 的以下目录，并确保这三个文件直接位于 `user-persona-forge` 文件夹内：
+
+```text
+public/scripts/extensions/third-party/user-persona-forge/
+├── manifest.json
+├── index.js
+├── style.css
+└── README.md
+```
+
+也可以下载本仓库的 ZIP 源码，解压后将文件夹放入上述位置。完成后在 SillyTavern 的扩展管理中启用并刷新页面。
+
+仓库地址：<https://github.com/Paino47/-UU>
+
+## 使用
+
+1. 点击酒馆顶栏的“面具工坊”。
+2. 在“区块库”中新建内容，或先用“常用字段”建立空白条目。
+3. 点击区块上的“加入合成”，或勾选多个区块后批量加入合成台。
+4. 在“已保存面具”中选择一套或多套方案，可载入或合并到当前合成台。
+5. 在合成台调整顺序、检查预览；需要长期复用时保存为面具方案。
+6. 选择“复制文本”后粘贴到 User Persona，或直接选择“写入当前人设”。
+
+## 兼容性说明
+
+使用 SillyTavern 的 `getContext()` / `extensionSettings` 持久化接口。写入当前 Persona 时调用 Persona 描述框原生的 `input` 事件处理逻辑。若酒馆版本调整 Persona 面板的 DOM 结构，直接写入功能可能需要适配；复制文本功能不依赖该 DOM 结构。
