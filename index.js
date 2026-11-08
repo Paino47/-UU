@@ -28,6 +28,10 @@
     let editingBlock = null;
     let returnTab = 'library';
     let observer = null;
+    let personaObserver = null;
+    let previewFormat = 'markdown';
+    let previewDraft = null;
+    let previewSourceSignature = '';
     const selectedLibraryIds = new Set();
     const selectedMaskIds = new Set();
 
@@ -134,6 +138,56 @@
         return buildOutputForIds(settings.builderIds);
     }
 
+    function getPreviewSourceSignature() {
+        return JSON.stringify(settings.builderIds.map(id => {
+            const block = getBlock(id);
+            return block ? [block.id, block.title, block.category, block.content] : null;
+        }));
+    }
+
+    function formatOutput(format) {
+        const blocks = getBuilderBlocks().filter(block => String(block.content || '').trim());
+        if (format === 'plain') return buildOutput();
+        if (format === 'json') {
+            const data = {};
+            blocks.forEach(block => {
+                if (!data[block.category]) data[block.category] = [];
+                data[block.category].push({ title: block.title, content: block.content.trim() });
+            });
+            return JSON.stringify(data, null, 2);
+        }
+        if (format === 'yaml') {
+            const data = {};
+            blocks.forEach(block => {
+                if (!data[block.category]) data[block.category] = [];
+                data[block.category].push({ title: block.title, content: block.content.trim() });
+            });
+            return Object.entries(data).map(([category, entries]) =>
+                JSON.stringify(category) + ':\\n' + entries.map(entry =>
+                    '  - title: ' + JSON.stringify(entry.title) + '\\n    content: ' + JSON.stringify(entry.content)
+                ).join('\\n')
+            ).join('\\n');
+        }
+        const groups = [];
+        let currentCategory = null;
+        blocks.forEach(block => {
+            if (block.category !== currentCategory) {
+                currentCategory = block.category;
+                groups.push('## ' + currentCategory);
+            }
+            groups.push('- **' + block.title.replace(/\\*/g, '\\\\*') + '**：' + block.content.trim().replace(/\\n/g, '\\n  '));
+        });
+        return groups.join('\\n\\n');
+    }
+
+    function syncPreviewDraft(force = false) {
+        const signature = getPreviewSourceSignature();
+        if (force || signature !== previewSourceSignature || previewDraft === null) {
+            previewDraft = formatOutput(previewFormat);
+            previewSourceSignature = signature;
+        }
+    }
+
     function ensurePanel() {
         if (panel) return panel;
         panel = document.createElement('div');
@@ -196,6 +250,7 @@
         else if (activeTab === 'compose') body.innerHTML = renderComposer();
         else if (activeTab === 'masks') body.innerHTML = renderMasks();
         else body.innerHTML = renderLibrary();
+        renderPersonaInlinePanel();
     }
 
     function renderLibrary() {
@@ -266,9 +321,9 @@
             '<div class="upf-compose-layout"><section class="upf-builder-panel"><div class="upf-section-head"><div><span>ASSEMBLED PARTS</span><strong>已选区块</strong></div><b>' + blocks.length + '</b></div>' +
             '<div class="upf-builder-list">' + rows + '</div><button class="upf-wide-ghost" data-action="tab" data-tab="library">＋ 继续添加资料区块</button></section>' +
             '<section class="upf-preview-panel"><div class="upf-section-head"><div><span>LIVE PREVIEW</span><strong>人设预览</strong></div><b>' + (output ? output.length + ' 字符' : '空白') + '</b></div>' +
-            '<div class="upf-preview-paper">' + (output ? '<pre>' + esc(output) + '</pre>' : '<div class="upf-preview-empty">选择并填写区块后，完整的人设文本会显示在这里。</div>') + '</div>' +
+            '<div class="upf-preview-paper"><pre>' + esc(output || '选择并填写区块后，完整的人设文本会显示在这里。') + '</pre></div>' +
             '<div class="upf-output-actions"><button class="upf-primary-btn" data-action="copy-output" ' + (output ? '' : 'disabled') + '>复制合成文本</button>' +
-            '<button class="upf-secondary-btn" data-action="apply-output" ' + (output ? '' : 'disabled') + '>写入当前人设</button>' +
+            '<button class="upf-secondary-btn" data-action="open-persona-inline">前往人设注入区</button>' +
             '<button class="upf-text-btn" data-action="download-output" ' + (output ? '' : 'disabled') + '>导出 TXT</button></div>' +
             '<p class="upf-safe-note">写入操作只替换当前 Persona 的描述文本，不会改动人设名称、头像或绑定关系。</p></section></div>';
     }
@@ -732,9 +787,13 @@
                 render();
             }
         }
-        else if (action === 'copy-output') copyText(buildOutput());
-        else if (action === 'apply-output') applyToCurrentPersona();
-        else if (action === 'download-output') downloadFile('user-persona.txt', buildOutput(), 'text/plain;charset=utf-8');
+        else if (action === 'copy-output') copyText(previewDraft ?? buildOutput());
+        else if (action === 'download-output') downloadFile('user-persona.' + (previewFormat === 'plain' ? 'txt' : previewFormat), previewDraft ?? buildOutput(), previewFormat === 'json' ? 'application/json;charset=utf-8' : 'text/plain;charset=utf-8');
+        else if (action === 'open-persona-inline') {
+            closePanel();
+            document.querySelector('#upf-persona-inline')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            document.querySelector('#upf-persona-inline')?.querySelector('textarea')?.focus();
+        }
         else if (action === 'export-library') exportLibrary();
         else if (action === 'import-library') importLibrary();
         else if (action === 'rename-mask') {
@@ -767,23 +826,107 @@
         }
     }
 
-    function mountLauncher() {
-        if (document.querySelector('#upf-launch')) return true;
-        const personaButton = document.querySelector('#persona-management-button');
-        const host = personaButton?.parentElement ||
-            document.querySelector('#top-bar, #top-settings-holder, #extensionsMenu');
-        if (!host) return false;
+    function renderPersonaInlinePanel() {
+        const host = document.querySelector('#upf-persona-inline');
+        if (!host) return;
+        syncPreviewDraft();
+        const output = String(previewDraft || '');
+        const formatLabel = { markdown: 'Markdown', yaml: 'YAML', json: 'JSON', plain: '纯文本' };
+        host.innerHTML =
+            '<div class="upf-inline-head"><div><strong>面具工坊 · 合成预览</strong><small>在这里检查、编辑最终人设文本，再选择如何注入</small></div>' +
+            '<button type="button" class="upf-inline-manage" data-upf-action="open-forge">管理区块与面具</button></div>' +
+            '<div class="upf-inline-tools"><label>输出格式<select data-upf-format>' +
+            Object.entries(formatLabel).map(([value, label]) => '<option value="' + value + '" ' + (previewFormat === value ? 'selected' : '') + '>' + label + '</option>').join('') +
+            '</select></label><span class="upf-inline-count">' + output.length + ' 字符</span>' +
+            '<button type="button" class="upf-inline-refresh" data-upf-action="refresh-preview">按区块重新生成</button></div>' +
+            '<textarea class="upf-inline-output" spellcheck="false" aria-label="可编辑的最终人设文本" placeholder="合成台为空。先添加资料区块，再生成预览。">' + esc(output) + '</textarea>' +
+            '<div class="upf-inline-actions"><button type="button" class="upf-inline-primary" data-upf-action="apply-current" ' + (output ? '' : 'disabled') + '>注入：编辑当前选择的人设</button>' +
+            '<button type="button" data-upf-action="create-persona" ' + (output ? '' : 'disabled') + '>注入：创建新人设</button>' +
+            '<button type="button" data-upf-action="copy-output" ' + (output ? '' : 'disabled') + '>复制文本</button></div>' +
+            '<p class="upf-inline-note">编辑框中的内容就是最终注入内容；切换格式或重新生成预览会重新从区块合成。</p>';
+    }
 
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.id = 'upf-launch';
-        button.className = 'menu_button upf-launch';
-        button.innerHTML = '<span class="upf-launch-icon">U</span><span>面具工坊</span>';
-        button.title = '打开 User 面具工坊';
-        button.addEventListener('click', () => openPanel('library'));
+    function getInlineOutput() {
+        const field = document.querySelector('#upf-persona-inline .upf-inline-output');
+        return field ? field.value : String(previewDraft ?? formatOutput(previewFormat));
+    }
 
-        if (personaButton) personaButton.insertAdjacentElement('afterend', button);
-        else host.appendChild(button);
+    function writePersonaDescription(value) {
+        const field = document.querySelector('#persona_description');
+        if (!(field instanceof HTMLTextAreaElement)) {
+            notify('没有找到酒馆当前人设的描述框。请先展开 User 人设管理面板。', 'warning');
+            return false;
+        }
+        field.value = value;
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        if (field.value !== value) {
+            notify('酒馆描述框未能接收内容，请先复制文本保存。', 'error');
+            return false;
+        }
+        return true;
+    }
+
+    async function createPersonaFromOutput() {
+        const output = getInlineOutput();
+        if (!output.trim()) return;
+        const name = window.prompt('给这份新人设起一个名称：');
+        if (!name || !name.trim()) return;
+        const context = ctx();
+        if (typeof context?.executeSlashCommands !== 'function') {
+            notify('当前 SillyTavern 没有提供人设创建命令接口。请更新酒馆版本，或先复制文本手动创建。', 'error');
+            return;
+        }
+        try {
+            const command = '/persona-create name=' + JSON.stringify(name.trim()) + ' description=' + JSON.stringify(output) + ' select=true';
+            await context.executeSlashCommands(command);
+            notify('新人设已通过酒馆原生功能创建并选中。', 'success');
+        } catch (error) {
+            console.error('[User 面具工坊] persona creation failed', error);
+            notify('创建新人设失败。请确认 SillyTavern 版本支持 /persona-create。', 'error');
+        }
+    }
+
+    function mountPersonaInlinePanel() {
+        const description = document.querySelector('#persona_description');
+        if (!description) return false;
+        if (document.querySelector('#upf-persona-inline')) return true;
+        const section = document.createElement('section');
+        section.id = 'upf-persona-inline';
+        section.className = 'upf-persona-inline';
+        description.insertAdjacentElement('afterend', section);
+        renderPersonaInlinePanel();
+        section.addEventListener('input', event => {
+            if (event.target.matches('.upf-inline-output')) {
+                previewDraft = event.target.value;
+                const count = section.querySelector('.upf-inline-count');
+                if (count) count.textContent = previewDraft.length + ' 字符';
+            }
+        });
+        section.addEventListener('change', event => {
+            if (!event.target.matches('[data-upf-format]')) return;
+            previewFormat = event.target.value;
+            syncPreviewDraft(true);
+            renderPersonaInlinePanel();
+        });
+        section.addEventListener('click', async event => {
+            const button = event.target.closest('[data-upf-action]');
+            if (!button) return;
+            const action = button.dataset.upfAction;
+            if (action === 'open-forge') openPanel('library');
+            else if (action === 'refresh-preview') {
+                syncPreviewDraft(true);
+                renderPersonaInlinePanel();
+            }
+            else if (action === 'apply-current') {
+                const output = getInlineOutput();
+                if (!output.trim()) return;
+                const field = document.querySelector('#persona_description');
+                if (field?.value?.trim() && !window.confirm('这会替换当前选中人设的全部描述内容。原描述不会自动保留。确定继续吗？')) return;
+                if (writePersonaDescription(output)) notify('已更新当前选择的人设描述。', 'success');
+            }
+            else if (action === 'create-persona') await createPersonaFromOutput();
+            else if (action === 'copy-output') copyText(getInlineOutput());
+        });
         return true;
     }
 
@@ -792,15 +935,15 @@
         document.addEventListener('keydown', event => {
             if (event.key === 'Escape' && panel?.classList.contains('upf-open')) closePanel();
         });
-        if (mountLauncher()) return;
-        if (observer) observer.disconnect();
-        observer = new MutationObserver(() => {
-            if (mountLauncher()) {
-                observer.disconnect();
-                observer = null;
+        if (mountPersonaInlinePanel()) return;
+        if (personaObserver) personaObserver.disconnect();
+        personaObserver = new MutationObserver(() => {
+            if (mountPersonaInlinePanel()) {
+                personaObserver.disconnect();
+                personaObserver = null;
             }
         });
-        observer.observe(document.documentElement, { childList: true, subtree: true });
+        personaObserver.observe(document.documentElement, { childList: true, subtree: true });
     }
 
     if (document.readyState === 'loading') {
